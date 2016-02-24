@@ -18,8 +18,8 @@ from lib.cuckoo.common.config import Config
 cfg = Config("reporting")
 
 # Error handling for database backends
-if not cfg.mongodb.get("enabled") and not cfg.elasticsearchdb.get("enabled"):
-    raise Exception("No database backend reporting module is enabled! Please enable either ElasticSearch or MongoDB.")
+if not cfg.mongodb.get("enabled") and not cfg.elasticsearchdb.get("enabled") and not cfg.aws.get("enabled"):
+    raise Exception("No database backend reporting module is enabled! Please enable either ElasticSearch or MongoDB or AWS.")
 
 if cfg.mongodb.get("enabled") and cfg.elasticsearchdb.get("enabled"):
     raise Exception("Both database backend reporting modules are enabled. Please only enable ElasticSearch or MongoDB.")
@@ -61,8 +61,8 @@ if GATEWAYS:
         if "," in e:
             continue
         elif ipaddy_re.match(GATEWAYS[e]):
-            GATEWAYS_IP_MAP[GATEWAYS[e]]=e  
- 
+            GATEWAYS_IP_MAP[GATEWAYS[e]]=e
+
 
 # Enabled/Disable Zer0m0n tickbox on the submission page
 OPT_ZER0M0N = False

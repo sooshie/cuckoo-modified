@@ -14,6 +14,7 @@ import os
 import json
 import zipfile
 import tempfile
+import shutil
 
 from django.conf import settings
 from django.core.servers.basehttp import FileWrapper
@@ -61,6 +62,51 @@ if enabledconf["elasticsearchdb"]:
          }],
          timeout = 60)
 
+if enabledconf["aws"]:
+    import boto
+    s3_region = Config("reporting").aws.s3_region
+    s3_access_key = Config("reporting").aws.access_key
+    s3_secret_key = Config("reporting").aws.secret_key
+    s3_reports_bucket_name = Config("reporting").aws.reports_bucket
+    s3_shots_bucket_name = Config("reporting").aws.shots_bucket
+    s3_samples_bucket_name = Config("reporting").aws.samples_bucket
+    s3_files_bucket_name = Config("reporting").aws.files_bucket
+    s3_aux_bucket_name = Config("reporting").aws.aux_bucket
+    s3_logs_bucket_name = Config("reporting").aws.logs_bucket
+    s3_pcap_bucket_name = Config("reporting").aws.pcap_bucket
+
+def update_to_s3(access_key, secret_key, region, bucket_name, key_name, contents):
+    """Save a specific file to a specific location in S3"""
+    try:
+        s3_connection = boto.s3.connect_to_region(region, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+        s3_bucket = s3_connection.get_bucket(bucket_name)
+        s3_key = boto.s3.key.Key(s3_bucket)
+        s3_key.key = key_name
+    except Exception as e:
+        logging.error("Can't write {0} to AWS bucket {1}".format(key_name, bucket_name))
+        logging.error(str(e))
+        return str(e)
+    s3_key.set_contents_from_string(contents)
+    return ''
+
+def get_from_s3(access_key, secret_key, region, bucket_name, key_name):
+    """Retreive a file from S3"""
+    s3_connection = boto.s3.connect_to_region(region, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+    s3_bucket = s3_connection.get_bucket(bucket_name)
+    s3_key = s3_bucket.get_key(key_name)
+    if s3_key:
+        return s3_key.get_contents_as_string()
+    else:
+        logging.error("Can't retrieve {0} from AWS bucket {1}".format(key_name, bucket_name))
+        return ''
+
+def delete_from_s3(access_key, secret_key, region, bucket_name, key_name):
+    s3_connection = boto.s3.connect_to_region(region, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+    s3_bucket = s3_connection.get_bucket(bucket_name)
+    s3_key = s3_bucket.get_key(key_name)
+    if s3_key:
+        s3_bucket.delete_key(s3_key)
+
 def get_analysis_info(db, id=-1, task=None):
     if not task:
         task = db.view_task(id)
@@ -78,7 +124,7 @@ def get_analysis_info(db, id=-1, task=None):
                    {"info.id": int(new["id"])},
                    {
                        "info": 1, "virustotal_summary": 1,
-                       "info.custom":1, "info.shrike_msg":1, "malscore": 1, "malfamily": 1, 
+                       "info.custom":1, "info.shrike_msg":1, "malscore": 1, "malfamily": 1,
                        "network.pcap_sha256": 1,
                        "mlist_cnt": 1, "f_mlist_cnt": 1, "info.package": 1, "target.file.clamav": 1,
                        "suri_tls_cnt": 1, "suri_alert_cnt": 1, "suri_http_cnt": 1, "suri_file_cnt": 1
@@ -97,6 +143,13 @@ def get_analysis_info(db, id=-1, task=None):
             rtmp = rtmp[0]["_source"]
         else:
             pass
+
+    if enabledconf["aws"]:
+        doc = get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, new["id"])
+        if doc == '':
+            rtmp = {}
+        else:
+            rtmp = json.loads(doc)
 
     if rtmp:
         if rtmp.has_key("virustotal_summary") and rtmp["virustotal_summary"]:
@@ -132,7 +185,7 @@ def get_analysis_info(db, id=-1, task=None):
         if rtmp.has_key("info") and rtmp["info"].has_key("package") and rtmp["info"]["package"]:
             new["package"] = rtmp["info"]["package"]
         if rtmp.has_key("target") and rtmp["target"].has_key("file") and rtmp["target"]["file"].has_key("clamav"):
-            new["clamav"] = rtmp["target"]["file"]["clamav"] 
+            new["clamav"] = rtmp["target"]["file"]["clamav"]
 
         if "display_shrike" in enabledconf and enabledconf["display_shrike"] and rtmp.has_key("info") and rtmp["info"].has_key("shrike_msg") and rtmp["info"]["shrike_msg"]:
             new["shrike_msg"] = rtmp["info"]["shrike_msg"]
@@ -254,6 +307,9 @@ def chunk(request, task_id, pid, pagenum):
                           "\"%s\"" % (pid, task_id)
                      )['hits']['hits'][0]['_source']
 
+        if enabledconf["aws"]:
+            record = json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id)))
+
         if not record:
             raise PermissionDenied
 
@@ -276,6 +332,10 @@ def chunk(request, task_id, pid, pagenum):
                             doc_type="calls",
                             q="_id: \"%s\"" % objectid,
                         )["hits"]["hits"][0]["_source"]
+
+            if enabledconf["aws"]:
+                key_name = "{0}/{1}.{2}".format(task_id, pid, pagenum)
+                chunk = {"calls" : json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, key_name))}
         else:
             chunk = dict(calls=[])
 
@@ -308,6 +368,9 @@ def filtered_chunk(request, task_id, pid, category, apilist):
                          doc_type="analysis",
                          q="info.id: \"%s\" and behavior.processes.process_id: \"%s\"" % (task_id, pid),
                      )['hits']['hits'][0]['_source']
+
+        if enabledconf["aws"]:
+            record = json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id)))
 
         if not record:
             raise PermissionDenied
@@ -342,6 +405,8 @@ def filtered_chunk(request, task_id, pid, category, apilist):
                             doc_type="calls",
                             q="_id: \"%s\"" % call,
                         )['hits']['hits'][0]['_source']
+            if enabledconf["aws"]:
+                chunk = {'calls' : json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, call))}
             for call in chunk["calls"]:
                 if category == "all" or call["category"] == category:
                     if len(apis) > 0:
@@ -448,10 +513,11 @@ def gen_moloch_from_antivirus(virustotal):
         for key in virustotal["scans"]:
             if virustotal["scans"][key]["result"]:
                  virustotal["scans"][key]["moloch"] = settings.MOLOCH_BASE + "?date=-1&expression=" + quote("tags\x3d\x3d\x22VT:%s:%s\x22" % (key,virustotal["scans"][key]["result"]),safe='')
-    return virustotal 
+    return virustotal
 
 @require_safe
 def surialert(request,task_id):
+    #TODO AWS - this should not pull from mongo if aws is present
     report = results_db.analysis.find_one({"info.id": int(task_id)},{"suricata.alerts": 1},sort=[("_id", pymongo.DESCENDING)])
     if not report:
         return render_to_response("error.html",
@@ -473,6 +539,7 @@ def surialert(request,task_id):
 
 @require_safe
 def shrike(request,task_id):
+    #TODO AWS - this should not pull from mongo if aws is present
     shrike = results_db.analysis.find_one({"info.id": int(task_id)},{"info.shrike_url": 1,"info.shrike_msg": 1,"info.shrike_sid":1, "info.shrike_refer":1},sort=[("_id", pymongo.DESCENDING)])
     if not shrike:
         return render_to_response("error.html",
@@ -485,6 +552,7 @@ def shrike(request,task_id):
 
 @require_safe
 def surihttp(request,task_id):
+    #TODO AWS - this should not pull from mongo if aws is present
     report = results_db.analysis.find_one({"info.id": int(task_id)},{"suricata.http": 1},sort=[("_id", pymongo.DESCENDING)])
     if not report:
         return render_to_response("error.html",
@@ -506,6 +574,7 @@ def surihttp(request,task_id):
 
 @require_safe
 def suritls(request,task_id):
+    #TODO AWS - this should not pull from mongo if aws is present
     report = results_db.analysis.find_one({"info.id": int(task_id)},{"suricata.tls": 1},sort=[("_id", pymongo.DESCENDING)])
     if not report:
         return render_to_response("error.html",
@@ -527,6 +596,7 @@ def suritls(request,task_id):
 
 @require_safe
 def surifiles(request,task_id):
+    #TODO AWS - this should not pull from mongo if aws is present
     report = results_db.analysis.find_one({"info.id": int(task_id)},{"suricata.files": 1},sort=[("_id", pymongo.DESCENDING)])
     if not report:
         return render_to_response("error.html",
@@ -548,6 +618,7 @@ def surifiles(request,task_id):
 
 @require_safe
 def antivirus(request,task_id):
+    #TODO AWS - this should not pull from mongo if aws is present
     rtmp = results_db.analysis.find_one({"info.id": int(task_id)},{"virustotal": 1,"info.category": 1},sort=[("_id", pymongo.DESCENDING)])
     if not rtmp:
         return render_to_response("error.html",
@@ -599,6 +670,8 @@ def search_behavior(request, task_id):
                       )["hits"]["hits"][0]
             esidx = esquery["_index"]
             record = esquery["_source"]
+        if enabledconf["aws"]:
+            record = json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id)))
 
         # Loop through every process
         for process in record["behavior"]["processes"]:
@@ -622,6 +695,13 @@ def search_behavior(request, task_id):
                                q="_id: %s" % callitem
                                )["hits"]["hits"][0]["_source"]
                     chunks.append(data)
+            if enabledconf["aws"]:
+                # AWS does not have a features in S3 similar to MongoDB's $in
+                # so we'll just iterate the call list and query appropriately
+                chunks = list()
+                for callitem in process["calls"]:
+                    data = json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, callitem))
+                    chunks.append({'calls' : data})
 
             for chunk in chunks:
                 for call in chunk["calls"]:
@@ -667,6 +747,10 @@ def report(request, task_id):
         # Extract out data for Admin tab in the analysis page
         esdata = {"index": query["_index"], "id": query["_id"]}
         report["es"] = esdata
+    if enabledconf["aws"]:
+        report = json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id)))
+        # Something about the admin tab
+        report["es"] = {"index" : s3_reports_bucket_name, "id": str(task_id)}
     if not report:
         return render_to_response("error.html",
                                   {"error": "The specified analysis does not exist"},
@@ -754,21 +838,33 @@ def file(request, category, task_id, dlfile):
     }
 
     if category == "sample":
-        path = os.path.join(CUCKOO_ROOT, "storage", "binaries", dlfile)
-        file_name += ".bin"
+        if enabledconf["aws"]:
+            report = json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id)))
+            contents = get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_samples_bucket_name, report["target"]["file"]["sha256"])
+            file_name = report["target"]["file"]["sha256"] + ".bin"
+        else:
+            path = os.path.join(CUCKOO_ROOT, "storage", "binaries", dlfile)
+            file_name += ".bin"
     elif category == "pcap":
-        file_name += ".pcap"
-        # Forcefully grab dump.pcap, serve it as [sha256].pcap
-        path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
-                            task_id, "dump.pcap")
+        if enabledconf["aws"]:
+            contents = get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_pcap_bucket_name, str(task_id) + '/dump.pcap')
+            file_name = "dump.pcap"
+        else:
+            file_name += ".pcap"
+            # Forcefully grab dump.pcap, serve it as [sha256].pcap
+            path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
+                                task_id, "dump.pcap")
         cd = "application/vnd.tcpdump.pcap"
     elif category == "screenshot":
         file_name += ".jpg"
-        #print file_name
-        path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
-                            task_id, "shots", file_name)
+        if enabledconf["aws"]:
+            contents = get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_shots_bucket_name, str(task_id) + "/" + file_name)
+        else:
+            path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
+                                task_id, "shots", file_name)
         cd = "image/jpeg"
     elif category in extmap:
+        #TODO AWS
         file_name += extmap[category]
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
                             task_id, "memory", file_name)
@@ -777,20 +873,26 @@ def file(request, category, task_id, dlfile):
             path += ".zip"
             cd = "application/zip"
     elif category == "dropped":
-        buf = os.path.join(CUCKOO_ROOT, "storage", "analyses",
-                           task_id, "files", file_name)
-        # Grab smaller file name as we store guest paths in the
-        # [orig file name]_info.exe
-        dfile = min(os.listdir(buf), key=len)
-        path = os.path.join(buf, dfile)
-        file_name = dfile + ".bin"
+        if enabledconf["aws"]:
+            contents = get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_files_bucket_name, str(task_id) + "/" + file_name)
+            file_name += ".bin"
+        else:
+            buf = os.path.join(CUCKOO_ROOT, "storage", "analyses",
+                               task_id, "files", file_name)
+            # Grab smaller file name as we store guest paths in the
+            # [orig file name]_info.exe
+            dfile = min(os.listdir(buf), key=len)
+            path = os.path.join(buf, dfile)
+            file_name = dfile + ".bin"
     # Just for suricata dropped files currently
     elif category == "zip":
+        #AWS TODO
         file_name = "files.zip"
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
                             task_id, "logs", "files.zip")
         cd = "application/zip"
     elif category == "suricata":
+        #AWS TODO
         file_name = "file." + dlfile
         path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
                             task_id, "logs", "files", file_name)
@@ -803,14 +905,20 @@ def file(request, category, task_id, dlfile):
         cd = "application/octet-stream"
 
     try:
-        resp = StreamingHttpResponse(FileWrapper(open(path), 8192),
-                                     content_type=cd)
+        if enabledconf["aws"]:
+            resp = HttpResponse(contents, content_type=cd)
+        else:
+            resp = StreamingHttpResponse(FileWrapper(open(path), 8192),
+                                        content_type=cd)
     except:
         return render_to_response("error.html",
                                   {"error": "File not found"},
                                   context_instance=RequestContext(request))
 
-    resp["Content-Length"] = os.path.getsize(path)
+    if enabledconf["aws"]:
+        resp["Content-Length"] = len(contents)
+    else:
+        resp["Content-Length"] = os.path.getsize(path)
     resp["Content-Disposition"] = "attachment; filename=" + file_name
     return resp
 
@@ -829,6 +937,7 @@ def procdump(request, task_id, process_id, start, end):
                    q="info.id: \"%s\"" % task_id
                    )["hits"]["hits"][0]["_source"]
 
+    #TODO AWS support if we want prodump info
     dumpfile = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id,
                             "memory", origname)
     if not os.path.exists(dumpfile):
@@ -891,7 +1000,7 @@ def filereport(request, task_id, category):
         "maec": "report.maec-4.1.xml",
         "metadata": "report.metadata.xml",
     }
-
+    #TODO AWS if we want support for retrieving these files from S3
     if category in formats:
         file_path = os.path.join(CUCKOO_ROOT, "storage", "analyses", str(task_id), "reports", formats[category])
         file_name = str(task_id) + "_" + formats[category]
@@ -1016,6 +1125,7 @@ def perform_search(term, value):
         return results_db.analysis.find({term_map[term] : query_val}).sort([["_id", -1]])
     if enabledconf["elasticsearchdb"]:
         return es.search(index=fullidx, doc_type="analysis", q=term_map[term] + ": %s" % value)["hits"]["hits"]
+    #TODO AWS - there's no real good way to get searching from S3, probably worth a hybrid approach here
 
 def search(request):
     if "search" in request.POST:
@@ -1060,7 +1170,7 @@ def search(request):
         analyses = []
         for result in records:
             new = None
-            if enabledconf["mongodb"]:
+            if enabledconf["mongodb"] or enabledconf["aws"]:
                 new = get_analysis_info(db, id=int(result["info"]["id"]))
             if enabledconf["elasticsearchdb"]:
                 new = get_analysis_info(db, id=int(result["_source"]["info"]["id"]))
@@ -1135,6 +1245,17 @@ def remove(request, task_id):
                     doc_type="analysis",
                     id=esid,
                 )
+    if enabledconf["aws"]:
+        record = json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id)))
+        for process in record["behavior"]["processes"]:
+            for call in process['calls']:
+                delete_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, call)
+        for shot in record["shorts"]:
+            delete_from_s3(s3_access_key, s3_secret_key, s3_region, s3_shots_bucket_name, shot)
+        delete_from_s3(s3_access_key, s3_secret_key, s3_region, s3_pcap_bucket_name, str(task_id) + '/' + "dump.pcap")
+        delete_from_s3(s3_access_key, s3_secret_key, s3_region, s3_pcap_bucket_name, str(task_id) + '/' + "dump_sorted.pcap")
+        #TODO AWS - delete logs and files
+        delete_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id))
 
     # Delete from SQL db.
     db = Database()
@@ -1161,6 +1282,9 @@ def pcapstream(request, task_id, conntuple):
                     q="info.id : \"%s\"" % task_id
                  )["hits"]["hits"][0]["_source"]
 
+    if enabledconf["aws"]:
+        conndata = json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id)))
+
     if not conndata:
         return render_to_response("standalone_error.html",
             {"error": "The specified analysis does not exist"},
@@ -1183,8 +1307,15 @@ def pcapstream(request, task_id, conntuple):
         # This will check if we have a sorted PCAP
         test_pcap = conndata["network"]["sorted_pcap_sha256"]
         # if we do, build out the path to it
-        pcap_path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
-                                 task_id, "dump_sorted.pcap")
+        if enabledconf["aws"]:
+            data = get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_pcap_bucket_name, str(task_id) + '/' + 'dump_sorted.pcap')
+            temppath = os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id)
+            os.makedirs(temppath)
+            with open(os.path.join(temppath, 'dump_sorted.pcap'), 'wb') as outfile:
+                outfile.write(data)
+        else:
+            pcap_path = os.path.join(CUCKOO_ROOT, "storage", "analyses",
+                                    task_id, "dump_sorted.pcap")
         fobj = open(pcap_path, "rb")
     except Exception as e:
         #print str(e)
@@ -1194,6 +1325,8 @@ def pcapstream(request, task_id, conntuple):
 
     packets = list(network.packets_for_stream(fobj, offset))
     fobj.close()
+    if enabledconf["aws"]:
+        shutil.rmtree(os.path.join(CUCKOO_ROOT, "storage", "analyses", task_id))
 
     return HttpResponse(json.dumps(packets), content_type="application/json")
 
@@ -1216,6 +1349,8 @@ def comments(request, task_id):
             report = query["_source"]
             esid = query["_id"]
             esidx = query["_index"]
+        if enabledconf["aws"]:
+            report = json.loads(get_from_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id)))
         if "comments" in report["info"]:
             curcomments = report["info"]["comments"]
         else:
@@ -1249,10 +1384,15 @@ def comments(request, task_id):
                         }
                     }
                  )
+        if enabledconf["aws"]:
+            if not "comments" in report["info"]:
+                report["info"]["comments"] = []
+            report["info"]["comments"].append(buf)
+            update_to_s3(s3_access_key, s3_secret_key, s3_region, s3_reports_bucket_name, str(task_id), json.dumps(report))
+            
         return redirect('analysis.views.report', task_id=task_id)
 
     else:
         return render_to_response("error.html",
                                   {"error": "Invalid Method"},
                                   context_instance=RequestContext(request))
-
